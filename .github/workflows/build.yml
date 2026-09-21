@@ -22,17 +22,37 @@ jobs:
       - name: Setup Gradle CLI
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Reconstruct Android Project
+      - name: Extract Files From Source Text & Setup Project
         run: |
-          mkdir -p app/src/main/java/com/focuslock/whatsapp
-          mkdir -p app/src/main/res/xml
-          mkdir -p app/src/main/res/values
+          python3 - << 'EOF'
+          import os, re
 
-          unzip -q -o *.zip -d temp_files
+          txt_files = [f for f in os.listdir('.') if f.endswith('.txt') or 'source' in f]
+          target_file = txt_files[0] if txt_files else 'whatsapp-focus-lock-android-source.txt'
 
-          find temp_files -name "AndroidManifest.xml" -exec cp {} app/src/main/AndroidManifest.xml \;
-          find temp_files -name "accessibility_service_config.xml" -exec cp {} app/src/main/res/xml/ \;
-          find temp_files -name "*.kt" -exec cp {} app/src/main/java/com/focuslock/whatsapp/ \;
+          with open(target_file, 'r', encoding='utf-8') as f:
+              content = f.read()
+
+          pattern = re.compile(r'//\s*={10,}\s*\n//\s*FILE:\s*([^\n]+)\s*\n//\s*={10,}\s*\n')
+          parts = pattern.split(content)
+
+          for i in range(1, len(parts), 2):
+              rel_path = parts[i].strip()
+              file_content = parts[i+1].strip()
+              
+              if rel_path.startswith("android/"):
+                  rel_path = rel_path[len("android/"):]
+                  
+              dir_name = os.path.dirname(rel_path)
+              if dir_name:
+                  os.makedirs(dir_name, exist_ok=True)
+                  
+              if "AndroidManifest.xml" in rel_path:
+                  file_content = re.sub(r'android:(roundIcon|icon)="[^"]*"', '', file_content)
+
+              with open(rel_path, 'w', encoding='utf-8') as out:
+                  out.write(file_content)
+          EOF
 
           cat << 'EOF' > settings.gradle.kts
           pluginManagement {
@@ -55,8 +75,8 @@ jobs:
 
           cat << 'EOF' > build.gradle.kts
           plugins {
-              id("com.android.application") version "8.4.0" apply false
-              id("org.jetbrains.kotlin.android") version "1.9.22" apply false
+              id("com.android.application") version "8.4.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
           }
           EOF
 
@@ -66,9 +86,11 @@ jobs:
           android.nonTransitiveRClass=true
           EOF
 
+          mkdir -p app/src/main/res/values
           cat << 'EOF' > app/src/main/res/values/strings.xml
           <resources>
               <string name="app_name">WhatsApp Focus Lock</string>
+              <string name="accessibility_service_description">Locks WhatsApp until notification arrives</string>
           </resources>
           EOF
 
@@ -87,14 +109,14 @@ jobs:
                   minSdk = 26
                   targetSdk = 34
                   versionCode = 1
-                  versionName = "1.0"
+                  versionName = "1.0.0"
               }
 
               buildFeatures {
                   compose = true
               }
               composeOptions {
-                  kotlinCompilerExtensionVersion = "1.5.8"
+                  kotlinCompilerExtensionVersion = "1.5.14"
               }
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
@@ -109,11 +131,14 @@ jobs:
               val composeBom = platform("androidx.compose:compose-bom:2024.04.01")
               implementation(composeBom)
               implementation("androidx.compose.ui:ui")
-              implementation("androidx.compose.material3:material3")
+              implementation("androidx.compose.ui:ui-graphics")
               implementation("androidx.compose.ui:ui-tooling-preview")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.compose.material:material-icons-extended")
               implementation("androidx.activity:activity-compose:1.9.0")
               implementation("androidx.core:core-ktx:1.13.1")
               implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.7.0")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.0")
           }
           EOF
 
