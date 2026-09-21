@@ -1,0 +1,47 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Extract Project Files & Setup Environment
+        run: |
+          if ls *.zip 1> /dev/null 2>&1; then
+            mkdir -p extracted_temp
+            unzip -q -o *.zip -d extracted_temp
+            PROJ_DIR=$(dirname $(find extracted_temp -name "gradlew" -o -name "build.gradle*" | head -n 1))
+            if [ -n "$PROJ_DIR" ]; then
+              cp -rf "$PROJ_DIR"/* .
+              cp -rf "$PROJ_DIR"/.* . 2>/dev/null || true
+            fi
+          fi
+          
+          if [ ! -f "gradlew" ]; then
+            gradle wrapper
+          fi
+          chmod +x gradlew
+
+      - name: Build Debug APK
+        run: ./gradlew assembleDebug --no-daemon
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug
+          path: '**/build/outputs/apk/debug/*.apk'
+          
