@@ -1,0 +1,1185 @@
+// ==========================================
+// FILE: android/app/src/main/AndroidManifest.xml
+// ==========================================
+
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.focuslock.whatsapp">
+
+    <!-- Permissions required for Focus Lock Operation -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+    <application
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="WhatsApp Focus Lock"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+        <!-- Main Dashboard Activity with Jetpack Compose -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="WhatsApp Focus Lock">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Notification Listener Service -->
+        <service
+            android:name=".WhatsAppNotificationListener"
+            android:label="WhatsApp Notification Tracker"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+
+        <!-- Accessibility Service for Foreground Window Monitoring & Blocking -->
+        <service
+            android:name=".WhatsAppBlockerService"
+            android:label="WhatsApp Focus Blocker Service"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
+
+    </application>
+</manifest>
+
+
+// ==========================================
+// FILE: android/app/src/main/res/xml/accessibility_service_config.xml
+// ==========================================
+
+<?xml version="1.0" encoding="utf-8"?>
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagDefault"
+    android:canRetrieveWindowContent="false"
+    android:description="@string/accessibility_service_description"
+    android:notificationTimeout="100" />
+
+
+// ==========================================
+// FILE: android/app/src/main/java/com/focuslock/whatsapp/AppLockState.kt
+// ==========================================
+
+package com.focuslock.whatsapp
+
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
+
+/**
+ * Thread-safe singleton holding the global state of the focus lock.
+ * Designed for concurrent access across Background Services (NotificationListener,
+ * AccessibilityService) and Jetpack Compose UI.
+ */
+object AppLockState {
+
+    // Atomic primitives for high-performance non-blocking reads in AccessibilityService
+    private val _isUnlockedDueToNotification = AtomicBoolean(false)
+    private val _isLockActive = AtomicBoolean(true)
+    private val _lastNotificationTimestamp = AtomicLong(0L)
+    private val _emergencyBypassUntilTimestamp = AtomicLong(0L)
+
+    // Reactive StateFlows for Jetpack Compose UI Observation
+    private val _isUnlockedFlow = MutableStateFlow(false)
+    val isUnlockedDueToNotificationFlow: StateFlow<Boolean> = _isUnlockedFlow.asStateFlow()
+
+    private val _isLockActiveFlow = MutableStateFlow(true)
+    val isLockActiveFlow: StateFlow<Boolean> = _isLockActiveFlow.asStateFlow()
+
+    private val _lastTimestampFlow = MutableStateFlow(0L)
+    val lastNotificationTimestampFlow: StateFlow<Long> = _lastTimestampFlow.asStateFlow()
+
+    private val _emergencyBypassUntilFlow = MutableStateFlow(0L)
+    val emergencyBypassUntilFlow: StateFlow<Long> = _emergencyBypassUntilFlow.asStateFlow()
+
+    /**
+     * Timestamp (Epoch ms) until which Quick Emergency Bypass remains active.
+     */
+    var emergencyBypassUntilTimestamp: Long
+        get() = _emergencyBypassUntilTimestamp.get()
+        @Synchronized
+        set(value) {
+            _emergencyBypassUntilTimestamp.set(value)
+            _emergencyBypassUntilFlow.value = value
+        }
+
+    /**
+     * Returns true if emergency bypass is currently active and within the time window.
+     */
+    val isEmergencyBypassActive: Boolean
+        get() {
+            val until = _emergencyBypassUntilTimestamp.get()
+            return until > System.currentTimeMillis()
+        }
+
+    /**
+     * Activates a 5-minute (default) emergency bypass window.
+     */
+    @Synchronized
+    fun activateEmergencyBypass(durationMillis: Long = 5 * 60 * 1000L) {
+        emergencyBypassUntilTimestamp = System.currentTimeMillis() + durationMillis
+    }
+
+    /**
+     * Immediately cancels the emergency bypass.
+     */
+    @Synchronized
+    fun clearEmergencyBypass() {
+        emergencyBypassUntilTimestamp = 0L
+    }
+
+    /**
+     * Flag indicating whether WhatsApp is temporarily permitted because an active
+     * unread notification was posted and has not yet been dismissed or closed.
+     */
+    var isUnlockedDueToNotification: Boolean
+        get() = _isUnlockedDueToNotification.get()
+        @Synchronized
+        set(value) {
+            _isUnlockedDueToNotification.set(value)
+            _isUnlockedFlow.value = value
+        }
+
+    /**
+     * Master user switch enabling or disabling the targeted focus lock.
+     */
+    var isLockActive: Boolean
+        get() = _isLockActive.get()
+        @Synchronized
+        set(value) {
+            _isLockActive.set(value)
+            _isLockActiveFlow.value = value
+        }
+
+    /**
+     * Timestamp (Epoch ms) of the most recent notification received from WhatsApp.
+     */
+    var lastNotificationTimestamp: Long
+        get() = _lastNotificationTimestamp.get()
+        @Synchronized
+        set(value) {
+            _lastNotificationTimestamp.set(value)
+            _lastTimestampFlow.value = value
+        }
+
+    /**
+     * Convenience helper to reset session state upon leaving WhatsApp.
+     */
+    @Synchronized
+    fun resetUnlockState() {
+        isUnlockedDueToNotification = false
+    }
+}
+
+
+// ==========================================
+// FILE: android/app/src/main/java/com/focuslock/whatsapp/WhatsAppNotificationListener.kt
+// ==========================================
+
+package com.focuslock.whatsapp
+
+import android.service.notification.NotificationListenerService
+import android.service.notification.StatusBarNotification
+import android.util.Log
+
+/**
+ * Service that listens for incoming and dismissed notifications.
+ * When a notification from "com.whatsapp" is posted, it allows temporary access.
+ * When all notifications from "com.whatsapp" are dismissed, access is re-locked.
+ */
+class WhatsAppNotificationListener : NotificationListenerService() {
+
+    companion object {
+        private const val TAG = "WhatsAppNotifListener"
+        const val WHATSAPP_PACKAGE = "com.whatsapp"
+    }
+
+    override fun onListenerConnected() {
+        super.onListenerConnected()
+        Log.i(TAG, "NotificationListenerService connected. Checking existing active notifications.")
+        checkRemainingWhatsAppNotifications()
+    }
+
+    override fun onNotificationPosted(sbn: StatusBarNotification?) {
+        super.onNotificationPosted(sbn)
+        if (sbn == null) return
+
+        val pkgName = sbn.packageName
+        if (pkgName == WHATSAPP_PACKAGE) {
+            val postTime = sbn.postTime
+            Log.d(TAG, "WhatsApp notification posted at $postTime. Unlocking access.")
+            AppLockState.isUnlockedDueToNotification = true
+            AppLockState.lastNotificationTimestamp = postTime
+        }
+    }
+
+    override fun onNotificationRemoved(sbn: StatusBarNotification?) {
+        super.onNotificationRemoved(sbn)
+        if (sbn == null) return
+
+        val pkgName = sbn.packageName
+        if (pkgName == WHATSAPP_PACKAGE) {
+            Log.d(TAG, "WhatsApp notification removed. Checking if other WhatsApp notifications remain.")
+            checkRemainingWhatsAppNotifications()
+        }
+    }
+
+    /**
+     * Inspects active notifications in the status bar. If there are no longer
+     * any notifications from com.whatsapp, locks access.
+     */
+    private fun checkRemainingWhatsAppNotifications() {
+        try {
+            val activeNotifications: Array<StatusBarNotification>? = activeNotifications
+            val hasWhatsAppNotification = activeNotifications?.any { it.packageName == WHATSAPP_PACKAGE } ?: false
+
+            if (!hasWhatsAppNotification) {
+                Log.d(TAG, "No active WhatsApp notifications in status bar. Re-locking access.")
+                AppLockState.isUnlockedDueToNotification = false
+            } else {
+                Log.d(TAG, "Active WhatsApp notifications still present.")
+                AppLockState.isUnlockedDueToNotification = true
+            }
+        } catch (e: SecurityException) {
+            Log.e(TAG, "SecurityException while reading active notifications: ${e.message}", e)
+        }
+    }
+}
+
+
+// ==========================================
+// FILE: android/app/src/main/java/com/focuslock/whatsapp/WhatsAppBlockerService.kt
+// ==========================================
+
+package com.focuslock.whatsapp
+
+import android.accessibilityservice.AccessibilityService
+import android.content.Context
+import android.graphics.PixelFormat
+import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.provider.Settings
+import android.util.Log
+import android.view.Gravity
+import android.view.View
+import android.view.WindowManager
+import android.view.accessibility.AccessibilityEvent
+import android.widget.Button
+import android.widget.TextView
+
+/**
+ * Foreground Application Monitor Service using Android AccessibilityService.
+ * Observes TYPE_WINDOW_STATE_CHANGED events to detect whenever WhatsApp
+ * is brought to the foreground or exited.
+ */
+class WhatsAppBlockerService : AccessibilityService() {
+
+    companion object {
+        private const val TAG = "WhatsAppBlockerService"
+        const val WHATSAPP_PACKAGE = "com.whatsapp"
+    }
+
+    private var currentForegroundPackage: String? = null
+    private var windowManager: WindowManager? = null
+    private var overlayView: View? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        Log.i(TAG, "WhatsAppBlockerService connected.")
+        windowManager = getSystemService(Context.WINDOW_SERVICE) as? WindowManager
+    }
+
+    private var countdownOverlayView: View? = null
+    private var countdownRunnable: Runnable? = null
+
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        if (event == null || event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            return
+        }
+
+        val packageNameCharSequence = event.packageName ?: return
+        val newPackage = packageNameCharSequence.toString()
+
+        // Ignore system UI overlays (keyguard, volume panel, notifications shade)
+        if (newPackage == "android" || newPackage == "com.android.systemui") {
+            return
+        }
+
+        val previousPackage = currentForegroundPackage
+        currentForegroundPackage = newPackage
+
+        Log.d(TAG, "Foreground changed: previous=[$previousPackage] -> current=[$newPackage]")
+
+        // Case 1: User transitioned OUT of WhatsApp to any other app
+        if (previousPackage == WHATSAPP_PACKAGE && newPackage != WHATSAPP_PACKAGE) {
+            Log.i(TAG, "User exited WhatsApp to $newPackage. Resetting unlock notification state.")
+            AppLockState.resetUnlockState()
+            removeOverlay()
+            removeCountdownOverlay()
+        }
+
+        // Case 2: Target app is WhatsApp
+        if (newPackage == WHATSAPP_PACKAGE) {
+            handleWhatsAppForeground()
+        } else {
+            removeOverlay()
+            removeCountdownOverlay()
+        }
+    }
+
+    private fun handleWhatsAppForeground() {
+        val isLocked = AppLockState.isLockActive
+        val isUnlocked = AppLockState.isUnlockedDueToNotification || AppLockState.isEmergencyBypassActive
+
+        Log.d(TAG, "WhatsApp opened. isLockActive=$isLocked, isUnlocked=$isUnlocked (notif=${AppLockState.isUnlockedDueToNotification}, bypass=${AppLockState.isEmergencyBypassActive})")
+
+        if (isLocked && !isUnlocked) {
+            Log.w(TAG, "BLOCKED: WhatsApp accessed without notification or active bypass! Enforcing focus lock.")
+            removeCountdownOverlay()
+
+            // Method 1: Immediate minimize via GLOBAL_ACTION_HOME
+            val homeInvoked = performGlobalAction(GLOBAL_ACTION_HOME)
+            Log.d(TAG, "performGlobalAction(GLOBAL_ACTION_HOME) status: $homeInvoked")
+
+            // Method 2: Present full-screen blocking overlay if SYSTEM_ALERT_WINDOW is granted
+            if (Settings.canDrawOverlays(this)) {
+                mainHandler.post {
+                    showBlockingOverlay()
+                }
+            }
+        } else {
+            Log.i(TAG, "ALLOWED: WhatsApp opened with active authorization.")
+            removeOverlay()
+
+            // If unlocked specifically due to Emergency Bypass, show persistent on-screen countdown timer
+            if (AppLockState.isEmergencyBypassActive && Settings.canDrawOverlays(this)) {
+                mainHandler.post {
+                    showCountdownOverlay()
+                }
+            } else {
+                removeCountdownOverlay()
+            }
+        }
+    }
+
+    /**
+     * Renders a system-level blocking overlay window on top of WhatsApp.
+     */
+    private fun showBlockingOverlay() {
+        if (overlayView != null) return // Already displayed
+
+        val wm = windowManager ?: return
+
+        val layoutType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        } else {
+            @Suppress("DEPRECATION")
+            WindowManager.LayoutParams.TYPE_PHONE
+        }
+
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            layoutType,
+            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                    WindowManager.LayoutParams.FLAG_FULLSCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.CENTER
+        }
+
+        val layout = createOverlayView()
+        overlayView = layout
+
+        try {
+            wm.addView(layout, params)
+            Log.i(TAG, "Blocking overlay added successfully.")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to add blocking overlay: ${e.message}", e)
+        }
+    }
+
+    private fun createOverlayView(): View {
+        val container = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setBackgroundColor(android.graphics.Color.argb(245, 18, 24, 38))
+            setPadding(64, 64, 64, 64)
+        }
+
+        val icon = TextView(this).apply {
+            text = "🔒"
+            textSize = 48f
+            gravity = Gravity.CENTER
+            setPadding(0, 0, 0, 24)
+        }
+
+        val title = TextView(this).apply {
+            text = "WhatsApp is Locked"
+            textSize = 24f
+            setTextColor(android.graphics.Color.WHITE)
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+            setPadding(0, 0, 0, 16)
+        }
+
+        val message = TextView(this).apply {
+            text = "WhatsApp is locked in Focus Mode.\nIt only unlocks when a new WhatsApp notification arrives."
+            textSize = 15f
+            setTextColor(android.graphics.Color.argb(200, 255, 255, 255))
+            gravity = Gravity.CENTER
+            setPadding(0, 0, 0, 36)
+        }
+
+        // Quick Emergency Bypass Button (5 Minutes)
+        val bypassButton = Button(this).apply {
+            text = "⚡ Quick Emergency Bypass (5 Min)"
+            setBackgroundColor(android.graphics.Color.rgb(245, 158, 11))
+            setTextColor(android.graphics.Color.BLACK)
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+            setOnClickListener {
+                Log.i(TAG, "User activated Quick Emergency Bypass for 5 minutes.")
+                AppLockState.activateEmergencyBypass(5 * 60 * 1000L)
+                removeOverlay()
+                showCountdownOverlay()
+            }
+        }
+
+        val spacer = View(this).apply {
+            layoutParams = android.widget.LinearLayout.LayoutParams(
+                android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+                24
+            )
+        }
+
+        val exitButton = Button(this).apply {
+            text = "Return to Home"
+            setBackgroundColor(android.graphics.Color.rgb(37, 211, 102))
+            setTextColor(android.graphics.Color.BLACK)
+            setOnClickListener {
+                performGlobalAction(GLOBAL_ACTION_HOME)
+                removeOverlay()
+            }
+        }
+
+        container.addView(icon)
+        container.addView(title)
+        container.addView(message)
+        container.addView(bypassButton)
+        container.addView(spacer)
+        container.addView(exitButton)
+
+        return container
+    }
+
+    /**
+     * Renders an unobtrusive floating pill on screen with a live 5-minute countdown.
+     */
+    private fun showCountdownOverlay() {
+        if (countdownOverlayView != null) return
+
+        val wm = windowManager ?: return
+
+        val layoutType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        } else {
+            @Suppress("DEPRECATION")
+            WindowManager.LayoutParams.TYPE_PHONE
+        }
+
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            layoutType,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            y = 120
+        }
+
+        val pillLayout = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setBackgroundColor(android.graphics.Color.argb(230, 20, 28, 38))
+            setPadding(36, 16, 36, 16)
+        }
+
+        val timerText = TextView(this).apply {
+            setTextColor(android.graphics.Color.rgb(251, 191, 36))
+            textSize = 14f
+            typeface = android.graphics.Typeface.MONOSPACE
+            text = "⚡ Bypass: 05:00"
+            setPadding(0, 0, 24, 0)
+        }
+
+        val lockNowBtn = TextView(this).apply {
+            setTextColor(android.graphics.Color.rgb(248, 113, 113))
+            textSize = 12f
+            text = "✕ Lock Now"
+            setOnClickListener {
+                AppLockState.clearEmergencyBypass()
+                removeCountdownOverlay()
+                handleWhatsAppForeground()
+            }
+        }
+
+        pillLayout.addView(timerText)
+        pillLayout.addView(lockNowBtn)
+        countdownOverlayView = pillLayout
+
+        try {
+            wm.addView(pillLayout, params)
+
+            countdownRunnable = object : Runnable {
+                override fun run() {
+                    val remainingMs = AppLockState.emergencyBypassUntilTimestamp - System.currentTimeMillis()
+                    if (remainingMs > 0) {
+                        val minutes = (remainingMs / 1000) / 60
+                        val seconds = (remainingMs / 1000) % 60
+                        timerText.text = String.format("⚡ Bypass: %02d:%02d", minutes, seconds)
+                        mainHandler.postDelayed(this, 1000)
+                    } else {
+                        Log.i(TAG, "Emergency Bypass expired. Re-evaluating focus lock.")
+                        AppLockState.clearEmergencyBypass()
+                        removeCountdownOverlay()
+                        handleWhatsAppForeground()
+                    }
+                }
+            }
+            mainHandler.post(countdownRunnable!!)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to display countdown overlay: ${e.message}", e)
+        }
+    }
+
+    private fun removeCountdownOverlay() {
+        mainHandler.post {
+            countdownRunnable?.let { mainHandler.removeCallbacks(it) }
+            countdownRunnable = null
+            try {
+                if (countdownOverlayView != null) {
+                    windowManager?.removeView(countdownOverlayView)
+                    countdownOverlayView = null
+                    Log.d(TAG, "Countdown overlay removed.")
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error removing countdown overlay: ${e.message}", e)
+            }
+        }
+    }
+
+    private fun removeOverlay() {
+        mainHandler.post {
+            try {
+                if (overlayView != null) {
+                    windowManager?.removeView(overlayView)
+                    overlayView = null
+                    Log.d(TAG, "Blocking overlay removed.")
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error removing overlay: ${e.message}", e)
+            }
+        }
+    }
+
+    override fun onInterrupt() {
+        Log.w(TAG, "WhatsAppBlockerService interrupted.")
+        removeOverlay()
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        removeOverlay()
+    }
+}
+
+
+// ==========================================
+// FILE: android/app/src/main/java/com/focuslock/whatsapp/MainActivity.kt
+// ==========================================
+
+package com.focuslock.whatsapp
+
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.os.PowerManager
+import android.provider.Settings
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+class MainActivity : ComponentActivity() {
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContent {
+            MaterialTheme(
+                colorScheme = darkColorScheme(
+                    primary = Color(0xFF25D366),
+                    onPrimary = Color(0xFF003816),
+                    primaryContainer = Color(0xFF005224),
+                    onPrimaryContainer = Color(0xFF67FE8D),
+                    surface = Color(0xFF131B24),
+                    background = Color(0xFF0B1015),
+                    onSurface = Color(0xFFE2E8F0)
+                )
+            ) {
+                Surface(
+                    modifier = Modifier.fillMaxSize(),
+                    color = MaterialTheme.colorScheme.background
+                ) {
+                    FocusLockDashboard()
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun FocusLockDashboard() {
+    val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+
+    val isLockActive by AppLockState.isLockActiveFlow.collectAsState()
+    val isUnlockedDueToNotif by AppLockState.isUnlockedDueToNotificationFlow.collectAsState()
+    val lastNotifTimestamp by AppLockState.lastNotificationTimestampFlow.collectAsState()
+    val emergencyBypassUntil by AppLockState.emergencyBypassUntilFlow.collectAsState()
+
+    val isBypassActive = emergencyBypassUntil > System.currentTimeMillis()
+
+    var isAccessibilityGranted by remember { mutableStateOf(false) }
+    var isNotificationListenerGranted by remember { mutableStateOf(false) }
+    var isOverlayGranted by remember { mutableStateOf(false) }
+    var isBatteryOptimizedGranted by remember { mutableStateOf(false) }
+
+    fun refreshPermissions() {
+        isAccessibilityGranted = PermissionHelper.isAccessibilityServiceEnabled(
+            context,
+            WhatsAppBlockerService::class.java
+        )
+        isNotificationListenerGranted = PermissionHelper.isNotificationListenerEnabled(context)
+        isOverlayGranted = PermissionHelper.isOverlayPermissionGranted(context)
+        isBatteryOptimizedGranted = PermissionHelper.isBatteryOptimizationIgnored(context)
+    }
+
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                refreshPermissions()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
+
+    val scrollState = rememberScrollState()
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(
+                            modifier = Modifier
+                                .size(36.dp)
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(Color(0xFF25D366)),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Lock,
+                                contentDescription = "App Logo",
+                                tint = Color.Black,
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(12.dp))
+                        Column {
+                            Text(
+                                "WhatsApp Focus Lock",
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 18.sp
+                            )
+                            Text(
+                                "com.whatsapp targeted guard",
+                                fontSize = 12.sp,
+                                color = Color(0xFF94A3B8)
+                            )
+                        }
+                    }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = Color(0xFF131B24)
+                )
+            )
+        }
+    ) { innerPadding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(innerPadding)
+                .verticalScroll(scrollState)
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            // Master Lock Toggle Card
+            Card(
+                colors = CardDefaults.cardColors(
+                    containerColor = if (isLockActive) Color(0xFF0F3822) else Color(0xFF1E293B)
+                ),
+                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(20.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = if (isLockActive) "Focus Lock Active" else "Focus Lock Disabled",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = if (isLockActive) Color(0xFF4ADE80) else Color(0xFF94A3B8)
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = if (isLockActive)
+                                "WhatsApp is locked unless an active notification is present."
+                            else
+                                "WhatsApp can be accessed freely without restriction.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Color(0xFFCBD5E1)
+                        )
+                    }
+                    Switch(
+                        checked = isLockActive,
+                        onCheckedChange = { AppLockState.isLockActive = it },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = Color.White,
+                            checkedTrackColor = Color(0xFF25D366)
+                        )
+                    )
+                }
+            }
+
+            // Real-Time Runtime Status Card
+            Card(
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF161F2C)),
+                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Text(
+                        text = "AppLockState Monitor",
+                        fontWeight = FontWeight.SemiBold,
+                        fontSize = 15.sp,
+                        color = Color(0xFF94A3B8)
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text("Notification Access Gate:", fontSize = 14.sp)
+                        StatusChip(
+                            isPositive = isUnlockedDueToNotif,
+                            positiveText = "UNLOCKED (Active Notif)",
+                            negativeText = "LOCKED"
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Divider(color = Color(0xFF243042), thickness = 0.5.dp)
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column {
+                            Text("5-Min Emergency Bypass:", fontSize = 14.sp)
+                            if (isBypassActive) {
+                                val remainingSec = ((emergencyBypassUntil - System.currentTimeMillis()) / 1000).coerceAtLeast(0)
+                                val min = remainingSec / 60
+                                val sec = remainingSec % 60
+                                Text(
+                                    text = String.format("⚡ Active (%02d:%02d left)", min, sec),
+                                    fontSize = 12.sp,
+                                    color = Color(0xFFFBBF24),
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
+
+                        if (isBypassActive) {
+                            Button(
+                                onClick = { AppLockState.clearEmergencyBypass() },
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFEF4444)),
+                                shape = RoundedCornerShape(8.dp),
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                            ) {
+                                Text("Cancel", fontSize = 11.sp, color = Color.White)
+                            }
+                        } else {
+                            Button(
+                                onClick = { AppLockState.activateEmergencyBypass(5 * 60 * 1000L) },
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFD97706)),
+                                shape = RoundedCornerShape(8.dp),
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                            ) {
+                                Text("Start 5m", fontSize = 11.sp, color = Color.White)
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Divider(color = Color(0xFF243042), thickness = 0.5.dp)
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text("Last WhatsApp Notification:", fontSize = 14.sp)
+                        val timestampText = if (lastNotifTimestamp > 0) {
+                            SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(lastNotifTimestamp))
+                        } else {
+                            "None received"
+                        }
+                        Text(
+                            text = timestampText,
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Medium,
+                            color = Color(0xFF38BDF8)
+                        )
+                    }
+                }
+            }
+
+            // Required Permissions Header
+            Text(
+                text = "Required Android Permissions",
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.Bold,
+                color = Color(0xFF94A3B8),
+                modifier = Modifier.padding(top = 8.dp)
+            )
+
+            // 1. Accessibility Service
+            PermissionCard(
+                title = "Accessibility Service",
+                description = "Monitors foreground window changes to detect WhatsApp opens.",
+                isGranted = isAccessibilityGranted,
+                icon = Icons.Default.Accessibility,
+                actionLabel = "Enable in Settings",
+                onAction = {
+                    val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
+                    context.startActivity(intent)
+                }
+            )
+
+            // 2. Notification Listener
+            PermissionCard(
+                title = "Notification Listener",
+                description = "Detects incoming notifications from com.whatsapp to authorize temporary unlocks.",
+                isGranted = isNotificationListenerGranted,
+                icon = Icons.Default.Notifications,
+                actionLabel = "Grant Access",
+                onAction = {
+                    val intent = Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
+                    context.startActivity(intent)
+                }
+            )
+
+            // 3. System Alert Window (Overlay)
+            PermissionCard(
+                title = "System Alert Window (Overlay)",
+                description = "Permits drawing the blocking lock screen over WhatsApp.",
+                isGranted = isOverlayGranted,
+                icon = Icons.Default.Layers,
+                actionLabel = "Allow Overlay",
+                onAction = {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                        val intent = Intent(
+                            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                            Uri.parse("package:${context.packageName}")
+                        )
+                        context.startActivity(intent)
+                    }
+                }
+            )
+
+            // 4. Battery Optimization Whitelist
+            PermissionCard(
+                title = "Battery Optimization Whitelist",
+                description = "Prevents Android OS from killing background listener services.",
+                isGranted = isBatteryOptimizedGranted,
+                icon = Icons.Default.BatteryChargingFull,
+                actionLabel = "Whitelist App",
+                onAction = {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                        val intent = Intent(
+                            Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                            Uri.parse("package:${context.packageName}")
+                        )
+                        context.startActivity(intent)
+                    }
+                }
+            )
+        }
+    }
+}
+
+@Composable
+fun PermissionCard(
+    title: String,
+    description: String,
+    isGranted: Boolean,
+    icon: ImageVector,
+    actionLabel: String,
+    onAction: () -> Unit
+) {
+    Card(
+        colors = CardDefaults.cardColors(containerColor = Color(0xFF161F2C)),
+        shape = RoundedCornerShape(14.dp),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+                    Icon(
+                        imageVector = icon,
+                        contentDescription = title,
+                        tint = if (isGranted) Color(0xFF4ADE80) else Color(0xFFF87171),
+                        modifier = Modifier.size(24.dp)
+                    )
+                    Spacer(modifier = Modifier.width(12.dp))
+                    Text(
+                        text = title,
+                        fontWeight = FontWeight.SemiBold,
+                        fontSize = 15.sp,
+                        color = Color.White
+                    )
+                }
+                StatusBadge(isGranted = isGranted)
+            }
+
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(
+                text = description,
+                fontSize = 13.sp,
+                color = Color(0xFF94A3B8),
+                lineHeight = 18.sp
+            )
+
+            if (!isGranted) {
+                Spacer(modifier = Modifier.height(12.dp))
+                Button(
+                    onClick = onAction,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color(0xFF25D366),
+                        contentColor = Color.Black
+                    ),
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(actionLabel, fontWeight = FontWeight.SemiBold)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun StatusBadge(isGranted: Boolean) {
+    Box(
+        modifier = Modifier
+            .clip(RoundedCornerShape(6.dp))
+            .background(if (isGranted) Color(0xFF0F3822) else Color(0xFF3B1E22))
+            .padding(horizontal = 8.dp, vertical = 4.dp)
+    ) {
+        Text(
+            text = if (isGranted) "ACTIVE" else "MISSING",
+            color = if (isGranted) Color(0xFF4ADE80) else Color(0xFFF87171),
+            fontSize = 11.sp,
+            fontWeight = FontWeight.Bold
+        )
+    }
+}
+
+@Composable
+fun StatusChip(isPositive: Boolean, positiveText: String, negativeText: String) {
+    Box(
+        modifier = Modifier
+            .clip(CircleShape)
+            .background(if (isPositive) Color(0xFF0F3822) else Color(0xFF271C1E))
+            .padding(horizontal = 10.dp, vertical = 3.dp)
+    ) {
+        Text(
+            text = if (isPositive) positiveText else negativeText,
+            color = if (isPositive) Color(0xFF4ADE80) else Color(0xFFFB7185),
+            fontSize = 11.sp,
+            fontWeight = FontWeight.SemiBold
+        )
+    }
+}
+
+object PermissionHelper {
+    fun isAccessibilityServiceEnabled(context: Context, service: Class<*>): Boolean {
+        val expectedComponentName = "${context.packageName}/${service.name}"
+        val enabledServices = Settings.Secure.getString(
+            context.contentResolver,
+            Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+        ) ?: return false
+        return enabledServices.split(":").any { it.equals(expectedComponentName, ignoreCase = true) }
+    }
+
+    fun isNotificationListenerEnabled(context: Context): Boolean {
+        val listeners = Settings.Secure.getString(
+            context.contentResolver,
+            "enabled_notification_listeners"
+        ) ?: return false
+        return listeners.split(":").any { it.contains(context.packageName) }
+    }
+
+    fun isOverlayPermissionGranted(context: Context): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            Settings.canDrawOverlays(context)
+        } else {
+            true
+        }
+    }
+
+    fun isBatteryOptimizationIgnored(context: Context): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val powerManager = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
+            powerManager?.isIgnoringBatteryOptimizations(context.packageName) ?: false
+        } else {
+            true
+        }
+    }
+}
+
+
+// ==========================================
+// FILE: android/app/build.gradle.kts
+// ==========================================
+
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.compose")
+}
+
+android {
+    namespace = "com.focuslock.whatsapp"
+    compileSdk = 35
+
+    defaultConfig {
+        applicationId = "com.focuslock.whatsapp"
+        minSdk = 26
+        targetSdk = 35
+        versionCode = 1
+        versionName = "1.0.0"
+
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = false
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
+        }
+    }
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+    buildFeatures {
+        compose = true
+    }
+}
+
+dependencies {
+    implementation("androidx.core:core-ktx:1.15.0")
+    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
+    implementation("androidx.activity:activity-compose:1.10.0")
+    implementation(platform("androidx.compose:compose-bom:2024.12.01"))
+    implementation("androidx.compose.ui:ui")
+    implementation("androidx.compose.ui:ui-graphics")
+    implementation("androidx.compose.ui:ui-tooling-preview")
+    implementation("androidx.compose.material3:material3")
+    implementation("androidx.compose.material:material-icons-extended")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
+}
+
